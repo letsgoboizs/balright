@@ -78,10 +78,20 @@ const TYRONE_RELEASE_VOTE_OPTIONS = Object.freeze([
   { id: 'tyrone-vs-cops', label: 'Tyrone vs Cops' },
   { id: 'tyrone-souls-and-vs-cops', label: 'Tyrone Souls and vs Cops' }
 ]);
+const SITE_DIRECTION_VOTE_DOC_ID = 'site_direction_vote';
+const SITE_DIRECTION_VOTER_STORAGE_KEY = 'siteDirectionVoterId';
+const SITE_DIRECTION_VOTE_OPTIONS = Object.freeze([
+  { id: 'verityschool-inspired', label: 'Just chalk it and make a VeritySchool rip-off' },
+  { id: 'games-community', label: 'Just turn it into a chatroom type site' },
+  { id: 'new-project', label: 'Try a new type of website' },
+  { id: 'something-else', label: 'Something else' }
+]);
 let tyroneReleaseCountdownInterval = null;
 let tyroneReleaseVoteUnsub = null;
 let tyroneReleaseVoteCache = { dateKey: TYRONE_RELEASE_VOTE_DATE_KEY, ballots: [] };
 let tyroneReleaseVotePendingPrimaryOptionId = '';
+let siteDirectionVoteUnsub = null;
+let siteDirectionVoteCache = { votes: [] };
 
 window.getActiveTimedBan = window.getActiveTimedBan || async function() {
   return null;
@@ -322,6 +332,97 @@ function listenForTyroneReleaseVote() {
     tyroneReleaseVoteCache = normalizeTyroneReleaseVoteData({});
     updateTyroneReleaseTitleFromVote();
     renderTyroneReleaseVoteUi();
+  }
+}
+
+function getSiteDirectionVoterId() {
+  let voterId = localStorage.getItem(SITE_DIRECTION_VOTER_STORAGE_KEY);
+  if (!voterId) {
+    voterId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `voter_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    localStorage.setItem(SITE_DIRECTION_VOTER_STORAGE_KEY, voterId);
+  }
+  return voterId;
+}
+
+function normalizeSiteDirectionVotes(rawData) {
+  const data = rawData && typeof rawData === 'object' ? rawData : {};
+  const votes = Array.isArray(data.votes) ? data.votes : [];
+  const latestByVoter = {};
+  votes.forEach((entry) => {
+    const voterId = sanitizeNullableText(entry && entry.voterId, '');
+    const optionId = sanitizeNullableText(entry && entry.optionId, '');
+    if (!voterId || !SITE_DIRECTION_VOTE_OPTIONS.some((option) => option.id === optionId)) return;
+    latestByVoter[voterId] = { voterId, optionId };
+  });
+  return { votes: Object.values(latestByVoter) };
+}
+
+function renderSiteDirectionVote() {
+  const optionsNode = document.getElementById('site-direction-vote-options');
+  const statusNode = document.getElementById('site-direction-vote-status');
+  if (!optionsNode || !statusNode) return;
+  const counts = {};
+  SITE_DIRECTION_VOTE_OPTIONS.forEach((option) => { counts[option.id] = 0; });
+  siteDirectionVoteCache.votes.forEach((vote) => { counts[vote.optionId] += 1; });
+  const totalVotes = Object.values(counts).reduce((sum, count) => sum + count, 0);
+  const myVote = siteDirectionVoteCache.votes.find((vote) => vote.voterId === getSiteDirectionVoterId());
+  optionsNode.innerHTML = SITE_DIRECTION_VOTE_OPTIONS.map((option) => {
+    const selected = !!(myVote && myVote.optionId === option.id);
+    return `<button type="button" class="site-direction-vote-option ${selected ? 'is-selected' : ''}" aria-pressed="${selected}" onclick="submitSiteDirectionVote('${option.id}')"><span>${escapeHtml(option.label)}</span><span class="site-direction-vote-count">${counts[option.id] || 0}</span></button>`;
+  }).join('');
+  statusNode.textContent = `${totalVotes} vote${totalVotes === 1 ? '' : 's'} so far. ${myVote ? 'Your vote is saved; choose another option or click it again to remove it.' : 'One vote per browser. Select an option to vote.'}`;
+}
+
+async function submitSiteDirectionVote(optionId) {
+  if (!SITE_DIRECTION_VOTE_OPTIONS.some((option) => option.id === optionId)) return;
+  const statusNode = document.getElementById('site-direction-vote-status');
+  const optionsNode = document.getElementById('site-direction-vote-options');
+  if (statusNode) statusNode.textContent = 'Saving your vote...';
+  if (optionsNode) optionsNode.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+  const voterId = getSiteDirectionVoterId();
+  let savedVotes = [];
+  let removedVote = false;
+  try {
+    const db = getAdminDb();
+    const ref = db.collection('chat_meta').doc(SITE_DIRECTION_VOTE_DOC_ID);
+    await db.runTransaction(async (transaction) => {
+      const snapshot = await transaction.get(ref);
+      const current = normalizeSiteDirectionVotes(snapshot.exists ? (snapshot.data() || {}) : {});
+      const previousVote = current.votes.find((vote) => vote.voterId === voterId);
+      removedVote = !!(previousVote && previousVote.optionId === optionId);
+      savedVotes = current.votes.filter((vote) => vote.voterId !== voterId);
+      if (!removedVote) savedVotes.push({ voterId, optionId });
+      transaction.set(ref, {
+        votes: savedVotes,
+        updatedAtMs: Date.now(),
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      }, { merge: true });
+    });
+    siteDirectionVoteCache = { votes: savedVotes };
+    renderSiteDirectionVote();
+  } catch (_) {
+    if (statusNode) statusNode.textContent = 'Could not save your vote right now. Try again later.';
+    if (optionsNode) optionsNode.querySelectorAll('button').forEach((button) => { button.disabled = false; });
+  }
+}
+
+function initializeSiteDirectionVote() {
+  renderSiteDirectionVote();
+  try {
+    if (siteDirectionVoteUnsub) siteDirectionVoteUnsub();
+    siteDirectionVoteUnsub = getAdminDb().collection('chat_meta').doc(SITE_DIRECTION_VOTE_DOC_ID)
+      .onSnapshot((doc) => {
+        siteDirectionVoteCache = normalizeSiteDirectionVotes(doc.exists ? (doc.data() || {}) : {});
+        renderSiteDirectionVote();
+      }, () => {
+        const statusNode = document.getElementById('site-direction-vote-status');
+        if (statusNode) statusNode.textContent = 'Vote results are temporarily unavailable.';
+      });
+  } catch (_) {
+    const statusNode = document.getElementById('site-direction-vote-status');
+    if (statusNode) statusNode.textContent = 'Vote results are temporarily unavailable.';
   }
 }
 
@@ -587,6 +688,7 @@ window.openLoginRequestModal = window.openLoginRequestModal || function() {
 document.addEventListener('DOMContentLoaded', function() {
   var userList = document.getElementById('admin-user-list');
   initializeTyroneReleaseCountdown();
+  initializeSiteDirectionVote();
   if (typeof bootHighValueFeatureState === 'function') bootHighValueFeatureState();
   if (typeof renderGameStorefront === 'function') renderGameStorefront();
   if (typeof initializeAdminSectionCards === 'function') initializeAdminSectionCards();
